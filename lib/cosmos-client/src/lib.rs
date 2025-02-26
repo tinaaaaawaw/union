@@ -24,14 +24,11 @@ use unionlabs::{
     signer::CosmosSigner,
 };
 
-// TODO: Add read and write versions of this
-#[derive(Debug, Clone)]
-pub struct Ctx {
-    signer: CosmosSigner,
-    client: cometbft_rpc::Client,
-    gas_config: GasConfig,
-    chain_id: String,
-}
+use crate::{gas::GasFillerT, rpc::RpcT, wallet::WalletT};
+
+pub mod gas;
+pub mod rpc;
+pub mod wallet;
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct GasConfig {
@@ -81,41 +78,6 @@ impl<W, Q, G> TxClient<W, Q, G> {
     pub fn new(wallet: W, rpc: Q, gas: G) -> Self {
         Self { wallet, rpc, gas }
     }
-}
-
-pub mod rpc {
-    pub trait RpcT {
-        fn client(&self) -> &cometbft_rpc::Client;
-
-        // TODO: Better type here
-        fn chain_id(&self) -> &str;
-    }
-
-    #[derive(Debug, Clone)]
-    pub struct Rpc {
-        client: cometbft_rpc::Client,
-        chain_id: String,
-    }
-
-    impl RpcT for Rpc {
-        fn client(&self) -> &cometbft_rpc::Client {
-            &self.client
-        }
-
-        fn chain_id(&self) -> &str {
-            &self.chain_id
-        }
-    }
-}
-
-pub trait GasFillerT {
-    async fn max_gas(&self) -> u64;
-
-    async fn mk_fee(&self, gas: u64) -> Fee;
-}
-
-pub trait WalletT {
-    fn signer(&self) -> &CosmosSigner;
 }
 
 impl<W: WalletT, Q: RpcT, G: GasFillerT> TxClient<W, Q, G> {
