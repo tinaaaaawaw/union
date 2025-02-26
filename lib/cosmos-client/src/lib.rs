@@ -3,25 +3,23 @@
 use anyhow::{anyhow, bail, Context, Result};
 use cometbft_rpc::rpc_types::TxResponse;
 use protos::cosmos::base::abci;
-use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tracing::{debug, info};
 use unionlabs::{
+    bech32::Bech32,
     cosmos::{
         auth::base_account::BaseAccount,
-        base::{abci::gas_info::GasInfo, coin::Coin},
+        base::abci::gas_info::GasInfo,
         crypto::{secp256k1, AnyPubKey},
         tx::{
-            auth_info::AuthInfo, fee::Fee, mode_info::ModeInfo, sign_doc::SignDoc,
-            signer_info::SignerInfo, signing::sign_info::SignMode, tx::Tx, tx_body::TxBody,
-            tx_raw::TxRaw,
+            auth_info::AuthInfo, mode_info::ModeInfo, sign_doc::SignDoc, signer_info::SignerInfo,
+            signing::sign_info::SignMode, tx::Tx, tx_body::TxBody, tx_raw::TxRaw,
         },
     },
     encoding::{EncodeAs, Proto},
     google::protobuf::any::Any,
     primitives::H256,
     prost::{Message, Name},
-    signer::CosmosSigner,
 };
 
 use crate::{gas::GasFillerT, rpc::RpcT, wallet::WalletT};
@@ -29,44 +27,6 @@ use crate::{gas::GasFillerT, rpc::RpcT, wallet::WalletT};
 pub mod gas;
 pub mod rpc;
 pub mod wallet;
-
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct GasConfig {
-    pub gas_price: f64,
-    pub gas_denom: String,
-    pub gas_multiplier: f64,
-    pub max_gas: u64,
-    pub min_gas: u64,
-}
-
-impl GasConfig {
-    pub fn mk_fee(&self, gas: u64) -> Fee {
-        // gas limit = provided gas * multiplier, clamped between min_gas and max_gas
-        let gas_limit = u128_saturating_mul_f64(gas.into(), self.gas_multiplier)
-            .clamp(self.min_gas.into(), self.max_gas.into());
-
-        let amount = u128_saturating_mul_f64(gas.into(), self.gas_price);
-
-        Fee {
-            amount: vec![Coin {
-                amount,
-                denom: self.gas_denom.clone(),
-            }],
-            gas_limit: gas_limit.try_into().unwrap_or(u64::MAX),
-            payer: String::new(),
-            granter: String::new(),
-        }
-    }
-}
-
-fn u128_saturating_mul_f64(u: u128, f: f64) -> u128 {
-    (num_rational::BigRational::from_integer(u.into())
-        * num_rational::BigRational::from_float(f).expect("finite"))
-    .to_integer()
-    .try_into()
-    .unwrap_or(u128::MAX)
-    // .expect("overflow")
-}
 
 pub struct TxClient<W, Q, G> {
     wallet: W,
@@ -77,6 +37,18 @@ pub struct TxClient<W, Q, G> {
 impl<W, Q, G> TxClient<W, Q, G> {
     pub fn new(wallet: W, rpc: Q, gas: G) -> Self {
         Self { wallet, rpc, gas }
+    }
+
+    pub fn wallet(&self) -> &W {
+        &self.wallet
+    }
+
+    pub fn rpc(&self) -> &Q {
+        &self.rpc
+    }
+
+    pub fn gas(&self) -> &G {
+        &self.gas
     }
 }
 
@@ -113,13 +85,13 @@ impl<W: WalletT, Q: RpcT, G: GasFillerT> TxClient<W, Q, G> {
     /// - submit tx
     /// - wait for inclusion
     /// - return (tx_hash, gas_used)
-    async fn broadcast_tx_commit(
+    pub async fn broadcast_tx_commit(
         &self,
         messages: impl IntoIterator<Item = protos::google::protobuf::Any> + Clone,
         memo: impl AsRef<str>,
     ) -> Result<(H256, TxResponse)> {
         let account = self
-            .account_info(&self.wallet.signer().to_string())
+            .account_info(self.wallet.address())
             .await
             .context("fetching account info")?;
 
@@ -143,26 +115,20 @@ impl<W: WalletT, Q: RpcT, G: GasFillerT> TxClient<W, Q, G> {
         );
 
         // re-sign the new auth info with the simulated gas
-        let signature = self
-            .wallet
-            .signer()
-            .try_sign(
-                &SignDoc {
-                    body_bytes: tx_body.clone().encode_as::<Proto>(),
-                    auth_info_bytes: auth_info.clone().encode_as::<Proto>(),
-                    chain_id: self.rpc.chain_id().to_string(),
-                    account_number: account.account_number,
-                }
-                .encode_as::<Proto>(),
-            )
-            .expect("signing failed")
-            .to_bytes()
-            .to_vec();
+        let signature = self.wallet.sign(
+            &SignDoc {
+                body_bytes: tx_body.clone().encode_as::<Proto>(),
+                auth_info_bytes: auth_info.clone().encode_as::<Proto>(),
+                chain_id: self.rpc.chain_id().to_string(),
+                account_number: account.account_number,
+            }
+            .encode_as::<Proto>(),
+        );
 
         let tx_raw_bytes = TxRaw {
             body_bytes: tx_body.clone().encode_as::<Proto>(),
             auth_info_bytes: auth_info.clone().encode_as::<Proto>(),
-            signatures: [signature].to_vec(),
+            signatures: [signature.into()].to_vec(),
         }
         .encode_as::<Proto>();
 
@@ -264,7 +230,7 @@ impl<W: WalletT, Q: RpcT, G: GasFillerT> TxClient<W, Q, G> {
         }
     }
 
-    async fn simulate_tx(
+    pub async fn simulate_tx(
         &self,
         messages: impl IntoIterator<Item = protos::google::protobuf::Any> + Clone,
         memo: impl AsRef<str>,
@@ -272,7 +238,7 @@ impl<W: WalletT, Q: RpcT, G: GasFillerT> TxClient<W, Q, G> {
         use protos::cosmos::tx;
 
         let account = self
-            .account_info(&self.wallet.signer().to_string())
+            .account_info(self.wallet.address())
             .await
             .context("querying account info")?;
 
@@ -290,7 +256,7 @@ impl<W: WalletT, Q: RpcT, G: GasFillerT> TxClient<W, Q, G> {
         let auth_info = AuthInfo {
             signer_infos: [SignerInfo {
                 public_key: Some(AnyPubKey::Secp256k1(secp256k1::PubKey {
-                    key: self.wallet.signer().public_key().into(),
+                    key: self.wallet.public_key().into_encoding(),
                 })),
                 mode_info: ModeInfo::Single {
                     mode: SignMode::Direct,
@@ -301,21 +267,15 @@ impl<W: WalletT, Q: RpcT, G: GasFillerT> TxClient<W, Q, G> {
             fee: self.gas.mk_fee(self.gas.max_gas().await).await,
         };
 
-        let simulation_signature = self
-            .wallet
-            .signer()
-            .try_sign(
-                &SignDoc {
-                    body_bytes: tx_body.clone().encode_as::<Proto>(),
-                    auth_info_bytes: auth_info.clone().encode_as::<Proto>(),
-                    chain_id: self.rpc.chain_id().to_string(),
-                    account_number: account.account_number,
-                }
-                .encode_as::<Proto>(),
-            )
-            .expect("signing failed")
-            .to_bytes()
-            .to_vec();
+        let simulation_signature = self.wallet.sign(
+            &SignDoc {
+                body_bytes: tx_body.clone().encode_as::<Proto>(),
+                auth_info_bytes: auth_info.clone().encode_as::<Proto>(),
+                chain_id: self.rpc.chain_id().to_string(),
+                account_number: account.account_number,
+            }
+            .encode_as::<Proto>(),
+        );
 
         let simulate_response = self
             .rpc
@@ -326,7 +286,7 @@ impl<W: WalletT, Q: RpcT, G: GasFillerT> TxClient<W, Q, G> {
                     tx_bytes: Tx {
                         body: tx_body.clone(),
                         auth_info: auth_info.clone(),
-                        signatures: [simulation_signature.clone()].to_vec(),
+                        signatures: [simulation_signature.into()].to_vec(),
                     }
                     .encode_as::<Proto>(),
                     ..Default::default()
@@ -350,7 +310,7 @@ impl<W: WalletT, Q: RpcT, G: GasFillerT> TxClient<W, Q, G> {
         ))
     }
 
-    async fn account_info(&self, account: &str) -> Result<BaseAccount> {
+    pub async fn account_info<T: AsRef<[u8]>>(&self, account: Bech32<T>) -> Result<BaseAccount> {
         debug!(%account, "fetching account");
 
         Ok(self
@@ -372,80 +332,5 @@ impl<W: WalletT, Q: RpcT, G: GasFillerT> TxClient<W, Q, G> {
             .map(<Any<BaseAccount>>::try_from)
             .context("decoding account info")??
             .0)
-    }
-}
-
-impl RpcT for Ctx {
-    fn client(&self) -> &cometbft_rpc::Client {
-        &self.client
-    }
-
-    fn chain_id(&self) -> &str {
-        &self.chain_id
-    }
-}
-
-impl WalletT for Ctx {
-    fn signer(&self) -> &CosmosSigner {
-        &self.signer
-    }
-}
-
-impl GasFillerT for Ctx {
-    async fn max_gas(&self) -> u64 {
-        self.gas_config.max_gas
-    }
-
-    async fn mk_fee(&self, gas: u64) -> Fee {
-        self.gas_config.mk_fee(gas)
-    }
-}
-
-impl Ctx {
-    pub async fn new(rpc_url: String, private_key: H256, gas_config: GasConfig) -> Result<Ctx> {
-        let client = cometbft_rpc::Client::new(rpc_url)
-            .await
-            .context("creating cometbft rpc client")?;
-
-        let prefix = client
-            .grpc_abci_query::<_, protos::cosmos::auth::v1beta1::Bech32PrefixResponse>(
-                "/cosmos.auth.v1beta1.Query/Bech32Prefix",
-                &protos::cosmos::auth::v1beta1::Bech32PrefixRequest {},
-                None,
-                false,
-            )
-            .await
-            .context("querying bech32 prefix")?
-            .into_result()?
-            .unwrap()
-            .bech32_prefix;
-
-        let chain_id = client
-            .status()
-            .await
-            .context("querying node status")?
-            .node_info
-            .network;
-
-        let ctx = Ctx {
-            signer: CosmosSigner::new(
-                bip32::secp256k1::ecdsa::SigningKey::from_bytes(&private_key.into())
-                    .expect("invalid private key"),
-                prefix,
-            ),
-            client,
-            gas_config,
-            chain_id,
-        };
-
-        Ok(ctx)
-    }
-
-    pub fn gas_config(&self) -> &GasConfig {
-        &self.gas_config
-    }
-
-    pub fn chain_id(&self) -> &str {
-        &self.chain_id
     }
 }

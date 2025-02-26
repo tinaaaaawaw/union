@@ -261,7 +261,7 @@ pub trait CosmosSdkChainExt: CosmosSdkChainRpcs {
         let auth_info = AuthInfo {
             signer_infos: [SignerInfo {
                 public_key: Some(AnyPubKey::Secp256k1(secp256k1::PubKey {
-                    key: signer.public_key().into(),
+                    key: signer.public_key().into_encoding(),
                 })),
                 mode_info: ModeInfo::Single {
                     mode: SignMode::Direct,
