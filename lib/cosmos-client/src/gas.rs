@@ -48,3 +48,13 @@ impl GasFillerT for GasConfig {
         }
     }
 }
+
+impl<T: GasFillerT> GasFillerT for &T {
+    async fn max_gas(&self) -> u64 {
+        (*self).max_gas().await
+    }
+
+    async fn mk_fee(&self, gas: u64) -> Fee {
+        (*self).mk_fee(gas).await
+    }
+}

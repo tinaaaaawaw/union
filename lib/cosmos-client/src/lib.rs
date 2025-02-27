@@ -1,7 +1,10 @@
+#![warn(clippy::unwrap_used)]
 #![allow(async_fn_in_trait)]
 
-use anyhow::{anyhow, bail, Context, Result};
-use cometbft_rpc::rpc_types::TxResponse;
+use cometbft_rpc::{
+    rpc_types::{BroadcastTxSyncResponse, GrpcAbciQueryError, TxResponse},
+    JsonRpcError,
+};
 use protos::cosmos::base::abci;
 use sha2::Digest;
 use tracing::{debug, info};
@@ -17,9 +20,10 @@ use unionlabs::{
         },
     },
     encoding::{EncodeAs, Proto},
-    google::protobuf::any::Any,
-    primitives::H256,
-    prost::{Message, Name},
+    google::protobuf::any::{Any, TryFromAnyError},
+    primitives::{Bytes, H256},
+    prost::{self, Message, Name},
+    ErrorReporter,
 };
 
 use crate::{gas::GasFillerT, rpc::RpcT, wallet::WalletT};
@@ -57,7 +61,7 @@ impl<W: WalletT, Q: RpcT, G: GasFillerT> TxClient<W, Q, G> {
         &self,
         msg: M,
         memo: impl AsRef<str>,
-    ) -> Result<(H256, R)> {
+    ) -> Result<(H256, R), TxError> {
         let (tx_hash, result) = self
             .broadcast_tx_commit(
                 [protos::google::protobuf::Any {
@@ -66,17 +70,22 @@ impl<W: WalletT, Q: RpcT, G: GasFillerT> TxClient<W, Q, G> {
                 }],
                 memo,
             )
-            .await
-            .context("broadcast_tx_commit")?;
+            .await?;
+
+        let response = <abci::v1beta1::TxMsgData as Message>::decode(
+            &*result.tx_result.data.unwrap_or_default(),
+        )
+        .map_err(TxError::TxMsgDataDecode)?;
+
+        if *response.msg_responses[0].type_url != R::type_url() {
+            return Err(TxError::IncorrectResponseTypeUrl {
+                expected: R::type_url(),
+                found: response.msg_responses[0].clone().type_url,
+            });
+        }
 
         let response =
-            <abci::v1beta1::TxMsgData as Message>::decode(&*result.tx_result.data.unwrap())
-                .unwrap();
-
-        assert_eq!(&*response.msg_responses[0].type_url, R::type_url());
-
-        let response =
-            R::decode(&*response.msg_responses[0].value).context("parsing returned address")?;
+            R::decode(&*response.msg_responses[0].value).map_err(TxError::TxMsgDataDecode)?;
 
         Ok((tx_hash, response))
     }
@@ -89,16 +98,11 @@ impl<W: WalletT, Q: RpcT, G: GasFillerT> TxClient<W, Q, G> {
         &self,
         messages: impl IntoIterator<Item = protos::google::protobuf::Any> + Clone,
         memo: impl AsRef<str>,
-    ) -> Result<(H256, TxResponse)> {
-        let account = self
-            .account_info(self.wallet.address())
-            .await
-            .context("fetching account info")?;
+    ) -> Result<(H256, TxResponse), BroadcastTxCommitError> {
+        let account = self.account_info(self.wallet.address()).await?;
 
-        let (tx_body, mut auth_info, simulation_gas_info) = self
-            .simulate_tx(messages, memo)
-            .await
-            .context("simulate_tx")?;
+        let (tx_body, mut auth_info, simulation_gas_info) =
+            self.simulate_tx(messages, memo).await?;
 
         info!(
             gas_used = %simulation_gas_info.gas_used,
@@ -110,7 +114,6 @@ impl<W: WalletT, Q: RpcT, G: GasFillerT> TxClient<W, Q, G> {
 
         info!(
             fee = %auth_info.fee.amount[0].amount,
-            // gas_multiplier = %self.gas_config.gas_multiplier,
             "submitting transaction with gas"
         );
 
@@ -142,54 +145,27 @@ impl<W: WalletT, Q: RpcT, G: GasFillerT> TxClient<W, Q, G> {
             return Ok((tx_hash, tx));
         }
 
-        let response = self
-            .rpc
-            .client()
-            .broadcast_tx_sync(&tx_raw_bytes)
-            .await
-            .context("broadcast_tx_sync")?;
+        let response = self.rpc.client().broadcast_tx_sync(&tx_raw_bytes).await?;
 
         assert_eq!(tx_hash, response.hash, "tx hash calculated incorrectly");
 
-        info!(%tx_hash);
-
         info!(
+            %tx_hash,
             check_tx_code = %response.code,
+            check_tx_log = %response.log,
             codespace = %response.codespace,
-            check_tx_log = %response.log
         );
 
         if response.code > 0 {
-            bail!(
-                "cosmos tx failed: {}, {}: {}",
-                response.code,
-                response.codespace,
-                response.log
-            );
+            return Err(BroadcastTxCommitError::TxFailed(response));
         };
 
-        let mut target_height = self
-            .rpc
-            .client()
-            .block(None)
-            .await
-            .context("querying latest block")?
-            .block
-            .header
-            .height;
+        let mut target_height = self.rpc.client().block(None).await?.block.header.height;
 
         let mut i = 0;
         loop {
             let reached_height = 'l: loop {
-                let current_height = self
-                    .rpc
-                    .client()
-                    .block(None)
-                    .await
-                    .context("querying latest block for tx inclusion")?
-                    .block
-                    .header
-                    .height;
+                let current_height = self.rpc.client().block(None).await?.block.header.height;
 
                 if current_height >= target_height {
                     break 'l current_height;
@@ -199,29 +175,23 @@ impl<W: WalletT, Q: RpcT, G: GasFillerT> TxClient<W, Q, G> {
 
             let tx_inclusion = self.rpc.client().tx(tx_hash, false).await;
 
-            // debug!(?tx_inclusion);
-
             match tx_inclusion {
                 Ok(tx) => {
                     if tx.tx_result.code == 0 {
                         break Ok((tx_hash, tx));
                     } else {
-                        bail!(
-                            "cosmos tx failed: {}, {}: {}",
-                            response.code,
-                            response.codespace,
-                            response.log
-                        );
+                        return Err(BroadcastTxCommitError::TxFailed(response));
                     }
                 }
-                Err(err) if i > 5 => {
-                    return Err(anyhow!(
-                        "tx inclusion couldn't be retrieved after {i} attempt(s) (tx hash: {tx_hash})"
-                    )
-                    .context(err));
+                Err(source) if i > 5 => {
+                    return Err(BroadcastTxCommitError::Inclusion {
+                        attempts: i,
+                        tx_hash,
+                        error: source,
+                    });
                 }
-                Err(_) => {
-                    debug!("unable to retrieve tx inclusion, trying again");
+                Err(err) => {
+                    debug!(err = %ErrorReporter(err), "unable to retrieve tx inclusion, trying again");
                     target_height = reached_height.add(&1);
                     i += 1;
                     continue;
@@ -234,13 +204,10 @@ impl<W: WalletT, Q: RpcT, G: GasFillerT> TxClient<W, Q, G> {
         &self,
         messages: impl IntoIterator<Item = protos::google::protobuf::Any> + Clone,
         memo: impl AsRef<str>,
-    ) -> Result<(TxBody, AuthInfo, GasInfo)> {
+    ) -> Result<(TxBody, AuthInfo, GasInfo), SimulateTxError> {
         use protos::cosmos::tx;
 
-        let account = self
-            .account_info(self.wallet.address())
-            .await
-            .context("querying account info")?;
+        let account = self.account_info(self.wallet.address()).await?;
 
         let tx_body = TxBody {
             // TODO: Use RawAny here
@@ -294,23 +261,21 @@ impl<W: WalletT, Q: RpcT, G: GasFillerT> TxClient<W, Q, G> {
                 None,
                 false,
             )
-            .await
-            .context("submitting SimulateRequest")?
-            .into_result()?;
-
-        let result = simulate_response.unwrap();
+            .await?
+            .into_result()?
+            .ok_or(SimulateTxError::NoResponse)?;
 
         Ok((
             tx_body,
             auth_info,
-            result
-                .gas_info
-                .expect("gas info is present on successful simulation result")
-                .into(),
+            simulate_response.gas_info.unwrap_or_default().into(),
         ))
     }
 
-    pub async fn account_info<T: AsRef<[u8]>>(&self, account: Bech32<T>) -> Result<BaseAccount> {
+    pub async fn account_info<T: Clone + AsRef<[u8]>>(
+        &self,
+        account: Bech32<T>,
+    ) -> Result<BaseAccount, FetchAccountInfoError> {
         debug!(%account, "fetching account");
 
         Ok(self
@@ -324,13 +289,96 @@ impl<W: WalletT, Q: RpcT, G: GasFillerT> TxClient<W, Q, G> {
                 None,
                 false,
             )
-            .await
-            .context("querying account info")?
+            .await?
             .into_result()?
-            .unwrap()
+            .ok_or_else(|| {
+                FetchAccountInfoError::AccountNotFound(
+                    account.clone().map_data(|bz| bz.as_ref().into()),
+                )
+            })?
             .account
             .map(<Any<BaseAccount>>::try_from)
-            .context("decoding account info")??
+            .ok_or_else(|| {
+                FetchAccountInfoError::AccountNotFound(account.map_data(|bz| bz.as_ref().into()))
+            })??
             .0)
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BroadcastTxCommitError {
+    #[error("error fetching account info")]
+    FetchAccountInfo(#[from] FetchAccountInfoError),
+    #[error("error simulating tx")]
+    SimulateTx(#[from] SimulateTxError),
+    #[error("jsonrpc error")]
+    JsonRpc(#[from] JsonRpcError),
+    #[error(
+        "tx failed: code={}, codespace={}, data={}, log={}",
+        .0.code, .0.codespace, .0.data, .0.log
+    )]
+    TxFailed(BroadcastTxSyncResponse),
+    #[error("tx inclusion couldn't be retrieved after {attempts} attempt(s) (tx hash: {tx_hash})")]
+    Inclusion {
+        attempts: usize,
+        tx_hash: H256,
+        #[source]
+        error: JsonRpcError,
+    },
+}
+
+impl BroadcastTxCommitError {
+    pub fn as_json_rpc_error(&self) -> Option<&JsonRpcError> {
+        match self {
+            BroadcastTxCommitError::FetchAccountInfo(FetchAccountInfoError::JsonRpc(error))
+            | BroadcastTxCommitError::SimulateTx(SimulateTxError::JsonRpc(error))
+            | BroadcastTxCommitError::JsonRpc(error)
+            | BroadcastTxCommitError::Inclusion { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+
+    pub fn as_grpc_abci_query_error(&self) -> Option<&GrpcAbciQueryError> {
+        match self {
+            BroadcastTxCommitError::FetchAccountInfo(FetchAccountInfoError::Query(error))
+            | BroadcastTxCommitError::SimulateTx(SimulateTxError::Query(error)) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SimulateTxError {
+    #[error("error fetching account info")]
+    FetchAccountInfo(#[from] FetchAccountInfoError),
+    #[error("grpc abci query error")]
+    Query(#[from] GrpcAbciQueryError),
+    #[error("jsonrpc error")]
+    JsonRpc(#[from] JsonRpcError),
+    #[error("tx simulation returned an empty response")]
+    NoResponse,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum FetchAccountInfoError {
+    #[error("account {0} not found")]
+    AccountNotFound(Bech32<Bytes>),
+    #[error("grpc abci query error")]
+    Query(#[from] GrpcAbciQueryError),
+    #[error("error decoding account")]
+    Decode(#[from] TryFromAnyError<BaseAccount>),
+    #[error("jsonrpc error")]
+    JsonRpc(#[from] JsonRpcError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TxError {
+    #[error("error broadcasting transaction")]
+    BroadcastTxCommit(#[from] BroadcastTxCommitError),
+    #[error("incorrect type url for msg response, expected {expected} but found {found}")]
+    IncorrectResponseTypeUrl { expected: String, found: String },
+    #[error("unable to decode msg response")]
+    ResponseDecode(#[source] prost::DecodeError),
+    #[error("unable to tx response")]
+    TxMsgDataDecode(#[source] prost::DecodeError),
 }

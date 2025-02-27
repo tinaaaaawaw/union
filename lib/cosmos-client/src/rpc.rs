@@ -30,3 +30,13 @@ impl RpcT for Rpc {
         &self.chain_id
     }
 }
+
+impl<T: RpcT> RpcT for &T {
+    fn client(&self) -> &cometbft_rpc::Client {
+        (*self).client()
+    }
+
+    fn chain_id(&self) -> &str {
+        (*self).chain_id()
+    }
+}

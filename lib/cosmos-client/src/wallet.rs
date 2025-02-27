@@ -46,3 +46,17 @@ impl WalletT for LocalSigner {
             .into()
     }
 }
+
+impl<T: WalletT> WalletT for &T {
+    fn address(&self) -> Bech32<H160> {
+        (*self).address()
+    }
+
+    fn public_key(&self) -> FixedBytes<33> {
+        (*self).public_key()
+    }
+
+    fn sign(&self, bz: &[u8]) -> H512 {
+        (*self).sign(bz)
+    }
+}
