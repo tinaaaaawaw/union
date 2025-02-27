@@ -13,6 +13,7 @@ pub struct GasConfig {
     pub gas_denom: String,
     pub gas_multiplier: f64,
     pub max_gas: u64,
+    #[serde(default)]
     pub min_gas: u64,
 }
 

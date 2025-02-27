@@ -156,7 +156,7 @@ impl<W: WalletT, Q: RpcT, G: GasFillerT> TxClient<W, Q, G> {
             codespace = %response.codespace,
         );
 
-        if response.code > 0 {
+        if response.code.is_err() {
             return Err(BroadcastTxCommitError::TxFailed(response));
         };
 

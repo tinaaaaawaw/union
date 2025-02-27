@@ -3,6 +3,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    num::NonZeroU32,
     panic::AssertUnwindSafe,
 };
 
@@ -44,6 +45,7 @@ use unionlabs::{
     },
     encoding::{EncodeAs, Proto},
     google::protobuf::any::{mk_any, Any},
+    option_unwrap,
     primitives::{Bytes, H160, H256},
     signer::CosmosSigner,
     ErrorReporter,
@@ -79,7 +81,7 @@ pub struct Module {
     pub rpc: Rpc,
     pub gas_config: GasConfig,
     pub bech32_prefix: String,
-    pub fatal_errors: HashSet<(String, u32)>,
+    pub fatal_errors: HashSet<(String, NonZeroU32)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,14 +92,16 @@ pub struct Config {
     pub keyring: KeyringConfig,
     pub rpc_url: String,
     pub gas_config: GasConfig,
-    pub fatal_errors: HashSet<(String, u32)>,
+    /// A list of (codespace, code) tuples that are to be considered non-recoverable.
+    #[serde(default)]
+    pub fatal_errors: HashSet<(String, NonZeroU32)>,
 }
 
-const FATAL_ERRORS: &[(&str, u32)] = &[
+const FATAL_ERRORS: &[(&str, NonZeroU32)] = &[
     // https://github.com/cosmos/ibc-go/blob/main/modules/light-clients/08-wasm/types/errors.go
-    ("08-wasm", 4),
+    ("08-wasm", option_unwrap!(NonZeroU32::new(4))),
     // https://github.com/cosmos/ibc-go/blob/7f89b7dd8796eca1bfe07f8a7833f3ce2d7a8e04/modules/core/02-client/types/errors.go
-    ("client", 4),
+    ("client", option_unwrap!(NonZeroU32::new(4))),
 ];
 
 impl Plugin for Module {
@@ -146,6 +150,15 @@ impl Plugin for Module {
             chain_id: ChainId::new(chain_id),
             gas_config: config.gas_config,
             bech32_prefix,
+            fatal_errors: config
+                .fatal_errors
+                .into_iter()
+                .chain(
+                    FATAL_ERRORS
+                        .iter()
+                        .map(|(codespace, code)| ((*codespace).to_owned(), *code)),
+                )
+                .collect(),
         })
     }
 
@@ -351,7 +364,13 @@ impl PluginServer<ModuleCall, ModuleCallback> for Module {
                             }
                         }
                         BroadcastTxCommitError::TxFailed(tx_res) => {
-                            if self.fatal_errors.contains(&(tx_res.codespace, tx_res.code)) {
+                            if self.fatal_errors.contains(&(
+                                tx_res.codespace,
+                                *tx_res
+                                    .code
+                                    .as_err()
+                                    .expect("failed tx has failure error code"),
+                            )) {
                                 // deal with fatal error
                             } else {
                                 // ???

@@ -151,16 +151,16 @@ pub trait CosmosSdkChainExt: CosmosSdkChainRpcs {
             check_tx_log = %response.log
         );
 
-        if response.code != 0 {
-            let error = cosmos_sdk_error::CosmosSdkError::from_code_and_codespace(
-                &response.codespace,
-                response.code,
-            );
+        // if response.code != 0 {
+        //     let error = cosmos_sdk_error::CosmosSdkError::from_code_and_codespace(
+        //         &response.codespace,
+        //         response.code,
+        //     );
 
-            error!(%error, "cosmos tx failed");
+        //     error!(%error, "cosmos tx failed");
 
-            return Err(BroadcastTxCommitError::Tx(error));
-        };
+        //     return Err(BroadcastTxCommitError::Tx(error));
+        // };
 
         let mut target_height = self
             .tm_client()
