@@ -24,7 +24,7 @@ use jsonrpsee::{
 };
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{debug, error, info, info_span, instrument, trace, warn};
 use unionlabs::{
     self,
     bech32::Bech32,
@@ -335,7 +335,7 @@ impl PluginServer<ModuleCall, ModuleCallback> for Module {
                     None => return Err(ErrorObject::owned(-1, "no signers available", None::<()>)),
                     Some(Ok(())) => return Ok(noop()),
                     Some(Err(err)) => {
-                        dbg!(&err);
+                        // dbg!(&err);
 
                         let mut split_msgs = false;
 
@@ -396,7 +396,8 @@ impl PluginServer<ModuleCall, ModuleCallback> for Module {
                                 log,
                             } => {
                                 if let Some((msg_idx, log)) = parse_msg_idx_from_log(&log) {
-                                    info!(msg_idx, %log, "tx failed");
+                                    let _span = info_span!("cosmos msg failed", msg_idx);
+                                    info!(%log);
 
                                     match self.fatal_errors.get(&(codespace.clone(), error_code)) {
                                         // no msg
