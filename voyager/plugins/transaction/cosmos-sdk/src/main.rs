@@ -447,6 +447,9 @@ impl PluginServer<ModuleCall, ModuleCallback> for Module {
                                                 ModuleCall::SubmitTransaction(msgs),
                                             )))
                                         }
+                                    } else if msgs.len() == 1 {
+                                        warn!("cosmos msg failed");
+                                        Ok(noop())
                                     } else {
                                         Ok(seq(msgs.into_iter().map(|msg| {
                                             call(PluginMessage::new(
@@ -458,12 +461,17 @@ impl PluginServer<ModuleCall, ModuleCallback> for Module {
                                 } else {
                                     warn!("unable to parse message index from tx failure ({codespace}, {error_code}): {log}");
 
-                                    Ok(seq(msgs.into_iter().map(|msg| {
-                                        call(PluginMessage::new(
-                                            self.plugin_name(),
-                                            ModuleCall::SubmitTransaction(vec![msg]),
-                                        ))
-                                    })))
+                                    if msgs.len() == 1 {
+                                        warn!("cosmos msg failed");
+                                        Ok(noop())
+                                    } else {
+                                        Ok(seq(msgs.into_iter().map(|msg| {
+                                            call(PluginMessage::new(
+                                                self.plugin_name(),
+                                                ModuleCall::SubmitTransaction(vec![msg]),
+                                            ))
+                                        })))
+                                    }
                                 }
                             }
                             _ => Err(ErrorObject::owned(
